@@ -3,3 +3,4 @@ venv/
 google_credentials.json
 __pycache__/
 *.pyc
+google_credentials.json
