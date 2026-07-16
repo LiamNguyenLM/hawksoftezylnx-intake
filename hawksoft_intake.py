@@ -4,7 +4,6 @@ load_dotenv()
 import os
 import gspread
 import requests
-import uuid
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 
@@ -16,8 +15,12 @@ SCOPES = [
 HAWKSOFT_USERNAME = os.environ.get("HAWKSOFT_USERNAME", "")
 HAWKSOFT_PASSWORD = os.environ.get("HAWKSOFT_PASSWORD", "")
 HAWKSOFT_AGENCY_ID = os.environ.get("HAWKSOFT_AGENCY_ID", "")
-SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "New Prospect Intake")
-BASE_URL = "https://integration.hawksoft.app"
+EZLYNX_API_URL = os.environ.get("EZLYNX_API_URL", "").rstrip("/") + "/"
+EZLYNX_APP_SECRET = os.environ.get("EZLYNX_APP_SECRET", "")
+EZLYNX_ACCOUNT_USERNAME = os.environ.get("EZLYNX_ACCOUNT_USERNAME", "")
+EZLYNX_ACCOUNT_PASSWORD = os.environ.get("EZLYNX_ACCOUNT_PASSWORD", "")
+SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "hawksoft")
+HAWKSOFT_BASE_URL = "https://integration.hawksoft.app"
 
 
 def get_sheet():
@@ -25,24 +28,26 @@ def get_sheet():
         "google_credentials.json", scopes=SCOPES
     )
     client = gspread.authorize(creds)
-    sheet = client.open(SHEET_NAME).sheet1
-    return sheet
+    return client.open(SHEET_NAME).sheet1
 
 
-def split_name(full_name):
-    parts = full_name.strip().split(" ", 1)
-    first = parts[0] if len(parts) > 0 else ""
-    last = parts[1] if len(parts) > 1 else ""
-    return first, last
+def get_ezlynx_token():
+    response = requests.get(
+        f"{EZLYNX_API_URL}authenticate",
+        headers={
+            "EZAppSecret": EZLYNX_APP_SECRET,
+            "AccountUsername": EZLYNX_ACCOUNT_USERNAME
+        },
+        params={"password": EZLYNX_ACCOUNT_PASSWORD}
+    )
+    if response.status_code == 200:
+        return response.text.strip().strip('"')
+    return None
 
 
-def create_client(row):
-    first_name, last_name = split_name(row.get("First Name", "") + " " + row.get("Last Name", ""))
-
-    # If sheet has separate first/last columns, use those directly
-    if row.get("First Name") and row.get("Last Name"):
-        first_name = row["First Name"].strip()
-        last_name = row["Last Name"].strip()
+def create_hawksoft_client(row):
+    first = row.get("First Name", "").strip()
+    last = row.get("Last Name", "").strip()
 
     contacts = []
     if row.get("Email", "").strip():
@@ -50,11 +55,7 @@ def create_client(row):
     if row.get("Phone", "").strip():
         contacts.append({"Type": "CellPhone", "Value": row["Phone"].strip()})
 
-    person = {
-        "FirstName": first_name,
-        "LastName": last_name,
-        "MainContactType": "First"
-    }
+    person = {"FirstName": first, "LastName": last, "MainContactType": "First"}
     if contacts:
         person["Contacts"] = contacts
 
@@ -62,7 +63,7 @@ def create_client(row):
         "People": [person],
         "Log": {
             "Channel": 29,
-            "Note": f"Prospect created via email intake on {datetime.now().strftime('%Y-%m-%d')}",
+            "Note": f"Prospect created via intake form on {datetime.now().strftime('%Y-%m-%d')}",
             "TS": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
         },
         "Status": "Prospect"
@@ -76,14 +77,40 @@ def create_client(row):
             "Zip": row.get("ZIP", "").strip()
         }
 
-    url = f"{BASE_URL}/vendor/agency/{HAWKSOFT_AGENCY_ID}/client?version=4.0"
-    response = requests.post(
-        url,
+    return requests.post(
+        f"{HAWKSOFT_BASE_URL}/vendor/agency/{HAWKSOFT_AGENCY_ID}/client?version=4.0",
         json=body,
         auth=(HAWKSOFT_USERNAME, HAWKSOFT_PASSWORD)
     )
 
-    return response
+
+def create_ezlynx_applicant(row, ez_token):
+    first = row.get("First Name", "").strip()
+    last = row.get("Last Name", "").strip()
+
+    body = {
+        "FirstName": first,
+        "LastName": last,
+        "CurrentAddress": {
+            "AddressLine1": row.get("Address", "").strip(),
+            "City": row.get("City", "").strip(),
+            "State": row.get("State", "TX").strip(),
+            "Zip": row.get("ZIP", "").strip()
+        },
+        "CellPhone": row.get("Phone", "").strip(),
+        "Email": row.get("Email", "").strip()
+    }
+
+    return requests.post(
+        f"{EZLYNX_API_URL}Applicant/v2/",
+        json=body,
+        headers={
+            "Content-Type": "application/json",
+            "EZAppSecret": EZLYNX_APP_SECRET,
+            "EZToken": ez_token,
+            "AccountUsername": EZLYNX_ACCOUNT_USERNAME
+        }
+    )
 
 
 def process_intake():
@@ -91,10 +118,10 @@ def process_intake():
     sheet = get_sheet()
     all_rows = sheet.get_all_records()
 
-    # Find column indexes (1-based for gspread)
     headers = sheet.row_values(1)
     processed_col = headers.index("Processed") + 1
-    client_num_col = headers.index("Client Number") + 1
+    hs_num_col = headers.index("HawkSoft Client #") + 1
+    ez_id_col = headers.index("EZLynx ID") + 1
     notes_col = headers.index("Notes") + 1
 
     pending = [
@@ -103,32 +130,58 @@ def process_intake():
     ]
 
     if not pending:
-        print("No pending rows to process.")
+        print("No pending rows.")
         return
 
     print(f"Found {len(pending)} pending rows.")
+    print("Getting EZLynx token...")
+    ez_token = get_ezlynx_token()
+    if not ez_token:
+        print("Warning: Could not get EZLynx token. EZLynx creation will be skipped.")
 
     for row_num, row in pending:
         name = f"{row.get('First Name', '')} {row.get('Last Name', '')}".strip()
         print(f"Processing: {name}...")
+        notes = []
+        hs_num = ""
+        ez_id = ""
 
+        # HawkSoft
         try:
-            response = create_client(row)
-
-            if response.status_code == 200:
-                client_number = response.json().get("clientNumber", "")
-                sheet.update_cell(row_num, processed_col, datetime.now().strftime("%Y-%m-%d %H:%M"))
-                sheet.update_cell(row_num, client_num_col, str(client_number))
-                sheet.update_cell(row_num, notes_col, "Success")
-                print(f"  Created — HawkSoft Client #{client_number}")
+            hs_response = create_hawksoft_client(row)
+            if hs_response.status_code == 200:
+                hs_num = str(hs_response.json().get("clientNumber", ""))
+                notes.append("HawkSoft: Success")
+                print(f"  HawkSoft: Client #{hs_num}")
             else:
-                error_msg = f"Error {response.status_code}: {response.text[:200]}"
-                sheet.update_cell(row_num, notes_col, error_msg)
-                print(f"  Failed — {error_msg}")
-
+                notes.append(f"HawkSoft Error {hs_response.status_code}")
+                print(f"  HawkSoft failed: {hs_response.status_code}")
         except Exception as e:
-            sheet.update_cell(row_num, notes_col, f"Exception: {str(e)[:200]}")
-            print(f"  Exception: {e}")
+            notes.append(f"HawkSoft Exception: {str(e)[:100]}")
+            print(f"  HawkSoft exception: {e}")
+
+        # EZLynx
+        if ez_token:
+            try:
+                ez_response = create_ezlynx_applicant(row, ez_token)
+                if ez_response.status_code == 201:
+                    ez_id = str(ez_response.json())
+                    notes.append("EZLynx: Success")
+                    print(f"  EZLynx: Applicant #{ez_id}")
+                else:
+                    notes.append(f"EZLynx Error {ez_response.status_code}")
+                    print(f"  EZLynx failed: {ez_response.status_code}")
+            except Exception as e:
+                notes.append(f"EZLynx Exception: {str(e)[:100]}")
+                print(f"  EZLynx exception: {e}")
+        else:
+            notes.append("EZLynx: Skipped (no token)")
+
+        # Update sheet
+        sheet.update_cell(row_num, processed_col, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        sheet.update_cell(row_num, hs_num_col, hs_num)
+        sheet.update_cell(row_num, ez_id_col, ez_id)
+        sheet.update_cell(row_num, notes_col, " | ".join(notes))
 
     print("Done.")
 
